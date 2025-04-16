@@ -1610,15 +1610,43 @@ app.put('/file/:botId/*', async (req, res) => {
         }
 
         try {
+            // บันทึกการเปลี่ยนแปลงลงไฟล์
             fs.writeFileSync(fullPath, content, 'utf8');
-            bots[botId].logs.push(`[ข้อมูล] อัปเดตไฟล์: ${filePath}`);
-            res.json({ message: 'อัปเดตไฟล์สำเร็จ' });
+            
+            // เพิ่มบันทึกและอัพเดท state
+            if (bots[botId]) {
+                bots[botId].logs.push(`[ข้อมูล] บันทึกการเปลี่ยนแปลงไฟล์: ${filePath}`);
+                
+                // บันทึก state ลงฐานข้อมูล
+                await saveBotState(botId, {
+                    status: bots[botId].status,
+                    isFolder: bots[botId].isFolder,
+                    folder: bots[botId].folder,
+                    installCommand: bots[botId].installCommand,
+                    owner: bots[botId].owner,
+                    type: bots[botId].type,
+                    expireTime: bots[botId].expireTime
+                });
+
+                // รีสตาร์ทบอทถ้ากำลังทำงานอยู่
+                if (bots[botId].status === 'กำลังทำงาน' && bots[botId].process) {
+                    bots[botId].process.kill('SIGTERM');
+                    setTimeout(() => {
+                        if (bots[botId] && bots[botId].process && !bots[botId].process.killed) {
+                            bots[botId].process.kill('SIGKILL');
+                        }
+                        startBotProcess(botId, username);
+                    }, 1000);
+                }
+            }
+
+            res.json({ success: true, message: 'บันทึกและอัพเดทไฟล์สำเร็จ' });
         } catch (err) {
             res.status(500).json({ error: `ไม่สามารถบันทึกไฟล์ได้: ${err.message}` });
         }
     } catch (err) {
         console.error('Error updating file:', err);
-        res.status(500).json({ error: 'เกิดข้อผิดพลาดในการอัปเดตไฟล์' });
+        res.status(500).json({ error: 'เกิดข้อผิดพลาดในการอัพเดทไฟล์' });
     }
 });
 
@@ -1969,13 +1997,7 @@ app.post('/payment/truemoney', async (req, res) => {
     const voucherCode = matchResult[1];
 
     try {
-        // ตรวจสอบว่าผู้ใช้มีอยู่จริงหรือไม่
-        const user = await db.get('SELECT * FROM users WHERE username = ?', [username]);
-        if (!user) {
-            return res.status(404).json({ error: 'ไม่พบผู้ใช้' });
-        }
-
-        // ตรวจสอบว่าซองนี้เคยถูกใช้ในระบบแล้วหรือไม่
+        // ตรวจสอบว่าซองนี้เคยถูกใช้ในระบบแล้วหรือไม่ (ย้ายขึ้นมาตรวจสอบก่อน)
         const usedVoucher = await db.get('SELECT * FROM payments WHERE voucher_code = ?', [voucherCode]);
         if (usedVoucher) {
             return res.status(400).json({ 
@@ -1984,93 +2006,90 @@ app.post('/payment/truemoney', async (req, res) => {
                     amount: usedVoucher.amount,
                     redeemed: "1/1",
                     total: "1",
-                    expireDate: new Date(usedVoucher.timestamp * 1000).toLocaleString('th-TH')
+                    expireDate: new Date(usedVoucher.timestamp * 1000).toLocaleString('th-TH'),
+                    transactionId: usedVoucher.id // เพิ่มเลขอ้างอิงธุรกรรม
                 }
             });
         }
 
-        const paymentPhone = "0825658423"; // เบอร์รับเงิน
+        // ตรวจสอบว่าผู้ใช้มีอยู่จริง
+        const user = await db.get('SELECT * FROM users WHERE username = ?', [username]);
+        if (!user) {
+            return res.status(404).json({ error: 'ไม่พบผู้ใช้' });
+        }
+
+        const paymentPhone = "0825658423";
         const apiUrl = `https://store.cyber-safe.pro/api/topup/truemoney/angpaofree/${voucherCode}/${paymentPhone}`;
 
-        try {
-            const response = await fetch(apiUrl);
-            const data = await response.json();
+        const response = await fetch(apiUrl);
+        const data = await response.json();
 
-            if (!response.ok || data.success === false) {
-                let errorMessage = "เกิดข้อผิดพลาด: ";
-                if (data.status.code === "VOUCHER_EXPIRED") errorMessage += "ซองหมดอายุ";
-                else if (data.status.code === "VOUCHER_REDEEMED") errorMessage += "ซองใช้แล้ว";
-                else errorMessage += data.status.message || "API ขัดข้อง";
+        if (!response.ok || data.success === false) {
+            let errorMessage = "เกิดข้อผิดพลาด: ";
+            if (data.status.code === "VOUCHER_EXPIRED") errorMessage += "ซองหมดอายุ";
+            else if (data.status.code === "VOUCHER_REDEEMED") errorMessage += "ซองใช้แล้ว";
+            else errorMessage += data.status.message || "API ขัดข้อง";
 
-                if (data.data && data.data.voucher) {
-                    return res.status(400).json({
-                        error: errorMessage,
-                        voucherInfo: {
-                            amount: data.data.voucher.amount_baht,
-                            redeemed: data.data.voucher.redeemed,
-                            total: data.data.voucher.member,
-                            expireDate: new Date(data.data.voucher.expire_date).toLocaleString('th-TH')
-                        }
-                    });
-                }
-                return res.status(400).json({ error: errorMessage });
+            if (data.data && data.data.voucher) {
+                return res.status(400).json({
+                    error: errorMessage,
+                    voucherInfo: {
+                        amount: data.data.voucher.amount_baht,
+                        redeemed: data.data.voucher.redeemed,
+                        total: data.data.voucher.member,
+                        expireDate: new Date(data.data.voucher.expire_date).toLocaleString('th-TH')
+                    }
+                });
             }
-
-            const amount = data.data.voucher.amount_baht;
-            
-            // ดึงค่าอัตราแลกเปลี่ยนจากการตั้งค่า
-            let settings;
-            try {
-                settings = JSON.parse(fs.readFileSync('settings.json', 'utf8'));
-            } catch (error) {
-                console.error('Error reading settings.json:', error);
-                settings = { exchangeRate: 10 }; // ค่าเริ่มต้นหากไม่สามารถอ่านไฟล์ได้
-            }
-            
-            // คำนวณเครดิตตามอัตราแลกเปลี่ยนที่ตั้งไว้
-            const exchangeRate = settings.exchangeRate || 10;
-            const credits = amount * exchangeRate;
-            
-            console.log(`เติมเงิน: ${amount} บาท, อัตราแลกเปลี่ยน: 1:${exchangeRate}, เครดิตที่ได้: ${credits}`);
-            
-            // เพิ่มเครดิตให้ผู้ใช้
-            await db.run('UPDATE users SET credits = credits + ? WHERE username = ?', [credits, username]);
-            const updatedUser = await db.get('SELECT credits FROM users WHERE username = ?', [username]);
-
-            // บันทึกประวัติการเติมเงิน
-            await db.run(
-                'INSERT INTO payments (username, amount, credits, payment_method, voucher_code) VALUES (?, ?, ?, ?, ?)',
-                'INSERT INTO payments (username, amount, credits, payment_method, voucher_code) VALUES (?, ?, ?, ?, ?)',
-                [username, amount, credits, 'truemoney', voucherCode]
-            );
-            
-            // ส่งการแจ้งเตือน Telegram เมื่อมีการเติมเงิน
-            if (settings.telegramNotifications && 
-                settings.telegramNotifications.enabled && 
-                settings.telegramNotifications.notifyOnDeposit) {
-                sendTelegramNotification(`💰 <b>มีการเติมเงินเข้าระบบ</b>\n\nผู้ใช้: <code>${username}</code>\nจำนวนเงิน: <code>${amount}</code> บาท\nเครดิตที่ได้รับ: <code>${credits}</code> เครดิต\nเวลา: <code>${new Date().toLocaleString('th-TH')}</code>`);
-            }
-
-            res.json({
-                success: true,
-                message: 'เติมเงินสำเร็จ',
-                phone: paymentPhone,
-                voucherCode,
-                amount,
-                creditsReceived: credits,
-                newCredits: updatedUser.credits
-            });
-
-        } catch (error) {
-            console.error('Error processing TrueMoney payment:', error);
-            res.status(500).json({
-                error: 'เกิดข้อผิดพลาดในการประมวลผลการชำระเงิน',
-                details: error.code === "ENOTFOUND" ? "เซิร์ฟเวอร์ API ไม่ตอบสนอง" : error.message
-            });
+            return res.status(400).json({ error: errorMessage });
         }
-    } catch (err) {
-        console.error('Error in payment endpoint:', err);
-        res.status(500).json({ error: 'เกิดข้อผิดพลาดในการประมวลผลการชำระเงิน' });
+
+        const amount = data.data.voucher.amount_baht;
+        
+        // ดึงค่าอัตราแลกเปลี่ยนจากการตั้งค่า
+        let settings;
+        try {
+            settings = JSON.parse(fs.readFileSync('settings.json', 'utf8'));
+        } catch (error) {
+            console.error('Error reading settings.json:', error);
+            settings = { exchangeRate: 10 };
+        }
+        
+        // คำนวณเครดิตและอัปเดตในฐานข้อมูล
+        const exchangeRate = settings.exchangeRate || 10;
+        const credits = amount * exchangeRate;
+        
+        await db.run('UPDATE users SET credits = credits + ? WHERE username = ?', [credits, username]);
+        const updatedUser = await db.get('SELECT credits FROM users WHERE username = ?', [username]);
+
+        // บันทึกประวัติการเติมเงินพร้อมสร้างเลขอ้างอิง
+        const result = await db.run(
+            'INSERT INTO payments (username, amount, credits, payment_method, voucher_code, timestamp) VALUES (?, ?, ?, ?, ?, ?)',
+            [username, amount, credits, 'truemoney', voucherCode, Math.floor(Date.now() / 1000)]
+        );
+
+        // ส่งการแจ้งเตือน Telegram
+        if (settings.telegramNotifications && 
+            settings.telegramNotifications.enabled && 
+            settings.telegramNotifications.notifyOnDeposit) {
+            sendTelegramNotification(`💰 <b>มีการเติมเงินเข้าระบบ</b>\n\nผู้ใช้: <code>${username}</code>\nจำนวนเงิน: <code>${amount}</code> บาท\nเครดิตที่ได้รับ: <code>${credits}</code> เครดิต\nเลขอ้างอิง: <code>${result.lastID}</code>\nเวลา: <code>${new Date().toLocaleString('th-TH')}</code>`);
+        }
+
+        res.json({
+            success: true,
+            message: 'เติมเงินสำเร็จ',
+            transactionId: result.lastID, // เพิ่มเลขอ้างอิงในการตอบกลับ
+            amount,
+            creditsReceived: credits,
+            newCredits: updatedUser.credits
+        });
+
+    } catch (error) {
+        console.error('Error processing TrueMoney payment:', error);
+        res.status(500).json({
+            error: 'เกิดข้อผิดพลาดในการประมวลผลการชำระเงิน',
+            details: error.code === "ENOTFOUND" ? "เซิร์ฟเวอร์ API ไม่ตอบสนอง" : error.message
+        });
     }
 });
 
